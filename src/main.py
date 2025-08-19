@@ -4,16 +4,21 @@ import pickle
 import tqdm
 import logging
 import glob
+import itertools
+import pvl
 
 import pipeline
 import helpers
 import config
+import database as db
+# from models.image import VoyagerImage
+from repository.image import create_user_from_dict, flatten_vicar_object, upsert_foobar
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+db.Base.metadata.create_all(bind=db.engine)
 
 
 # Steps I need 
@@ -52,6 +57,8 @@ class ExtractTarfile(pipeline.Task):
         self.cached_files_list = self._get_cache_file_list()
         logger.info( f"cached files list has {len(self.cached_files_list)} entries" )
 
+        # print( self.cached_files_list)
+        # raise Exception("stop")
 
     def _parse_member_name(self, member_info ):
         import pathlib
@@ -90,7 +97,7 @@ class ExtractTarfile(pipeline.Task):
 
     def _get_members_info_file(self, tar, stem ):
 
-        tar_file_info_file = f"{self.cache_path}member_info/memberinfo_{stem}.p"
+        tar_file_info_file = f"{self.cache_path}/member_info/memberinfo_{stem}.p"
 
         if not os.path.isfile( tar_file_info_file ):
         
@@ -110,10 +117,10 @@ class ExtractTarfile(pipeline.Task):
 
         import glob
 
-        cache_file_list = glob.glob(f"{self.cache_path}tar_members/**", recursive=True)
+        cache_file_list = glob.glob( str( self.cache_path / "tar_members" / "**" ), recursive=True)
 
         if len(cache_file_list) == 0:
-            os.makedirs(f"{self.cache_path}tar_members/", exist_ok=True)
+            os.makedirs( self.cache_path / "tar_members", exist_ok=True)
 
         return { g:True for g in cache_file_list }
 
@@ -121,6 +128,8 @@ class ExtractTarfile(pipeline.Task):
 
     def process(self, item ):
         import tarfile
+
+        # print( item )
 
         tar_file_path = item["tar_file_path"]
         tar_stem = item["stem"]
@@ -138,43 +147,110 @@ class ExtractTarfile(pipeline.Task):
 
                 if self._filter_tar_members(member_dict,tar_stem):
 
-                    local_full_path = f"{self.cache_path}tar_members/"
+                    local_full_path = self.cache_path / "tar_members"
 
                     # if not os.path.isfile( local_full_path ):
-                    if not local_full_path in self.cached_files_list:
+                    
+                    local_full_fn = local_full_path / member_dict["member_info"].get_info()["name"]
+
+                    # print( self.cached_files_list )
+                    # print( local_full_fn)
+                    # print( not local_full_fn in self.cached_files_list )
+
+                    if not str( local_full_fn ) in self.cached_files_list:
+                        # print("extractnig")
+                        # raise Exception("stop")
                         tar.extract( member_dict["member_info"], path=local_full_path )  
                         pass
 
-                    member_dict["local_file_path"] = local_full_path + member_dict["member_name"]
+                    member_dict["local_file_path"] = local_full_fn
 
                     yield member_dict
 
 
 
+class LoadAndStoreMetadata(pipeline.Task):
 
-
-class ExtractTarMembers(pipeline.Task):
-
-    def __init__(self, name, cache_path):
+    def __init__(self, name):
 
         super().__init__( name )
 
-        self.cache_path = cache_path
-
-
-    def should_extract( self, member_info ) -> bool:
-        pass
-
-
-
     def process(self, item ):
-        import tarfile
+        
+        fn = item["local_file_path"]
 
-        all_tar_file_members = item["all_tar_file_members"]
-        stem = item["stem"]
-        tar_file_info_file = item["tar_file_info_file"]
+        # print( fn )
+    
+        with open( fn ) as fp:
+            metadata = pvl.loads( fp.read() )
+
+            flattened = flatten_vicar_object(metadata, to_exclude=["^VICAR_HEADER", "^IMAGE", "SOURCE_PRODUCT_ID"])
+
+            # create_user_from_dict(db.SessionLocal() , d=flattened)
+            with db.SessionLocal() as session:
+                upsert_foobar(session, voyager_image_dict=flattened)
+
+        return item
+
+
+
+
+# class ExtractTarMembers(pipeline.Task):
+
+#     def __init__(self, name, cache_path):
+
+#         super().__init__( name )
+
+#         self.cache_path = cache_path
+
+
+#     def should_extract( self, member_info ) -> bool:
+#         pass
+
+
+
+#     def process(self, item ):
+#         import tarfile
+
+#         all_tar_file_members = item["all_tar_file_members"]
+#         stem = item["stem"]
+#         tar_file_info_file = item["tar_file_info_file"]
 
         
+
+
+# class ExtractMetadata(pipeline.Task):
+
+#     def __init__(self, name, cache_path):
+
+#         super().__init__( name )
+
+#         self.cache_path = cache_path
+
+#         self.cached_files_list = self._get_cache_file_list()
+#         logger.info( f"cached files list has {len(self.cached_files_list)} entries" )
+
+
+
+#                             if inner_suffix == "LBL":
+
+#                                 with open( local_full_path ) as fp:
+#                                     metadata = pvl.loads( fp.read() )
+        
+#                                 this_metadata = { **r, 
+#                                     **{
+#                                         "image_time": metadata["IMAGE_TIME"],
+#                                         "filter_name": metadata["FILTER_NAME"],
+#                                         "filter_number": metadata["FILTER_NUMBER"],
+#                                         "instrument_name": metadata["INSTRUMENT_NAME"],
+#                                         "gain_mode_id": metadata["GAIN_MODE_ID"],
+#                                         "target_name": metadata["TARGET_NAME"],
+#                                         "exposure_duration": metadata["EXPOSURE_DURATION"],
+#                                     }
+#                                 }
+                                
+#                                 metadata_lbl.append( this_metadata )       
+
 
 
 
@@ -314,15 +390,46 @@ class ExtractTarMembers(pipeline.Task):
 
 def main():
 
-    p = pipeline.Pipeline()
+    # p = pipeline.Pipeline()
 
-    p.add_task( ListTarFiles( name="list_tars", source_path="source_files/") )
-    p.add_task( ExtractTarfile( name="list_tar_members", cache_path="cache/" ) )
-    output_list = p.run([1])
+    list_files_result = list( ListTarFiles( name="list_tars", source_path=config.source_path ).process([1]) )
 
-    for item in tqdm.tqdm( output_list ):
-        pass
-        # print( item )
+    extract_tar_file_obj = ExtractTarfile( name="list_tar_members", cache_path=config.cache_path )
+
+    extract_files_result = list( itertools.chain.from_iterable([ list(extract_tar_file_obj.process(item)) for item in list_files_result ]) )
+
+    lbl_list = [ item for item in extract_files_result if item["member_name"].endswith(".LBL") ]
+    img_list = [ item for item in extract_files_result if item["member_name"].endswith(".IMG") ]
+
+    # print( lbl_list[:50] )
+
+    logger.info( f"Found {len(lbl_list)} LBL files and {len(img_list)} IMG files, now INSERTing the LBL files to sqllite." )
+
+    if os.path.exists( config.db_loaded_fn ):
+        logger.info( f"Database already loaded, skipping insertion." )
+    else:
+
+        load_and_store_metadata_obj = LoadAndStoreMetadata( name="load_and_store_metadata" )
+
+        loaded_lbl_list = [ load_and_store_metadata_obj.process(item) for item in tqdm.tqdm(lbl_list) ]
+
+        # print( len( loaded_lbl_list))
+
+        open( config.db_loaded_fn, 'w').close()
+
+
 
 if __name__ == "__main__":
     main()
+
+    # fn = "/home/lobdellb/repos/voyager_flyby/cache/tar_members/VGISS_6115/DATA/C35170XX/C3517001_GEOMED.LBL"
+
+    # with open( fn ) as fp:
+    #     metadata = pvl.loads( fp.read() )
+
+    #     flattened = flatten_vicar_object(metadata, to_exclude=["^VICAR_HEADER", "^IMAGE", "SOURCE_PRODUCT_ID"])
+
+    #     create_user_from_dict(db.SessionLocal() , d=flattened)
+
+
+    print("Done")
