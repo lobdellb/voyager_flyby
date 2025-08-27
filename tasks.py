@@ -4,7 +4,7 @@ from invoke import task
 import os
 import hashlib
 
-dev_env = ".venv"
+dev_env = ".env"
 env_activate_fn = f"./{dev_env}/bin/activate"
 hash_file = f"{dev_env}/.requirements_hash"
 
@@ -69,3 +69,28 @@ def run_workflow(c):
 
     print("Running the workflow ...")
     c.run(f"source {env_activate_fn} && python src/main.py", pty=True )
+
+
+@task(create_dev_env)
+def marimo_diagnose_sqllite_perf(c):
+
+    check_cwd()
+
+    fn ="notebooks/diagnose_sqllite_perf.py"
+
+    print(f"Marimoing {fn} ...")
+    c.run(f"source {env_activate_fn} && marimo edit {fn}", pty=True )
+
+@task(create_dev_env)
+def marimo_inspect_vicar_problem(c):
+
+    check_cwd()
+
+    fn ="notebooks/inspect_vicar_problem.py"
+
+    print(f"Marimoing {fn} ...")
+
+    with c.cd("./src"):
+        c.run(f"source ../{env_activate_fn} && marimo edit ../{fn}", pty=True )
+
+

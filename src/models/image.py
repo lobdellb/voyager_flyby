@@ -9,8 +9,6 @@ import database
 class VoyagerImage(database.Base):
     __tablename__ = "voyager_images"
 
-    # id = Column(Integer, primary_key=True)
-
     PDS_VERSION_ID = Column(String)
     RECORD_TYPE = Column(String)
     RECORD_BYTES = Column(Integer)

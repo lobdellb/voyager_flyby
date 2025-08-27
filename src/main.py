@@ -6,13 +6,14 @@ import logging
 import glob
 import itertools
 import pvl
+import json
 
 import pipeline
 import helpers
 import config
 import database as db
 # from models.image import VoyagerImage
-from repository.image import create_user_from_dict, flatten_vicar_object, upsert_foobar
+from repository.image import upsert_image_metadata
 
 
 logging.basicConfig(level=logging.INFO)
@@ -174,21 +175,37 @@ class LoadAndStoreMetadata(pipeline.Task):
     def __init__(self, name):
 
         super().__init__( name )
+        self.queries_per_transaction = 1
+        self.current_queries = 0
 
-    def process(self, item ):
+
+    def upsert_image_metadata(self,session, product_id, fn ):
+
+        rv = upsert_image_metadata(session, product_id=product_id, fn=fn )   
+
+        self.current_queries += 1
+
+        if self.current_queries >= self.queries_per_transaction:
+            # session.commit()
+            self.current_queries = 0
+
+        return rv
+
+
+    def process(self, item, session ):
         
         fn = item["local_file_path"]
 
-        # print( fn )
-    
-        with open( fn ) as fp:
-            metadata = pvl.loads( fp.read() )
+        image_id = helpers.extract_prefix_from_filename(fn)
 
-            flattened = flatten_vicar_object(metadata, to_exclude=["^VICAR_HEADER", "^IMAGE", "SOURCE_PRODUCT_ID"])
+        # Example filename: C3480032_GEOMED.IMG
+        # After extraction, image_id should be 'C3480032'
 
-            # create_user_from_dict(db.SessionLocal() , d=flattened)
-            with db.SessionLocal() as session:
-                upsert_foobar(session, voyager_image_dict=flattened)
+        try:
+            self.upsert_image_metadata(session, product_id=f"{image_id}_GEOMED.IMG", fn=fn )     
+        except Exception as e:
+            print( f"{image_id}_GEOMED.IMG" )
+            raise e
 
         return item
 
@@ -411,7 +428,9 @@ def main():
 
         load_and_store_metadata_obj = LoadAndStoreMetadata( name="load_and_store_metadata" )
 
-        loaded_lbl_list = [ load_and_store_metadata_obj.process(item) for item in tqdm.tqdm(lbl_list) ]
+        with db.SessionLocal() as session:
+            loaded_lbl_list = [ load_and_store_metadata_obj.process(item, session) for item in tqdm.tqdm(lbl_list) ]
+            session.commit()
 
         # print( len( loaded_lbl_list))
 
@@ -421,6 +440,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    from models.image import VoyagerImage
+
+    # print( type( VoyagerImage.EARTH_RECEIVED_TIME.type ) )
+    # print( dir( VoyagerImage ) )
+    # print( VoyagerImage.__table__.columns )
+
+    # for c in VoyagerImage.__table__.columns:
+
+    #     print( c )
+    #     print( c.type )
 
     # fn = "/home/lobdellb/repos/voyager_flyby/cache/tar_members/VGISS_6115/DATA/C35170XX/C3517001_GEOMED.LBL"
 
