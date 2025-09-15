@@ -63,6 +63,8 @@ def upsert_image_metadata(session: Session, product_id: str, fn: str ):
             flatten_vicar_object(metadata, to_exclude=["^VICAR_HEADER", "^IMAGE", "SOURCE_PRODUCT_ID"])
         )
 
+        flattened_dict["LOCAL_FILENAME"] = str(fn).replace(".LBL",".IMG")
+
         voyager_image_obj = voyager_image_from_dict( d=flattened_dict )
 
         session.add(voyager_image_obj)

@@ -94,3 +94,30 @@ def marimo_inspect_vicar_problem(c):
         c.run(f"source ../{env_activate_fn} && marimo edit ../{fn}", pty=True )
 
 
+
+
+
+@task(create_dev_env)
+def marimo_inspect_metadata(c):
+
+    check_cwd()
+
+    fn ="notebooks/inspect_metadata.py"
+
+    print(f"Marimoing {fn} ...")
+
+    with c.cd("./src"):
+        c.run(f"source ../{env_activate_fn} && marimo edit ../{fn}", pty=True )
+
+
+@task(create_dev_env)
+def marimo_tune_hough_detection(c):
+
+    check_cwd()
+
+    fn ="notebooks/tune_hough_detection.py"
+
+    print(f"Marimoing {fn} ...")
+
+    with c.cd("./src"):
+        c.run(f"source ../{env_activate_fn} && marimo edit ../{fn}", pty=True )

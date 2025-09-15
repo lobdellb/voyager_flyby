@@ -1,34 +1,74 @@
 
+import cv2
+import numpy as np
 
 
-def find_circle_center(img):
+
+def find_circle_center_parametrized(
+        img,
+        blur_width,
+        method: int,
+        dp: float,
+        minDist:float,
+        param1:float = 100,
+        param2:float = 100,
+        minRadius:int = 0,
+        maxRadius:int = 0 
+    ):
+    
     # img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    img_blur = cv2.medianBlur(img, 5)
+    img_blur = cv2.medianBlur(img, blur_width)
 
     # img_blur = img
     
+    # circles = cv2.HoughCircles(
+    #     img_blur, 
+    #     cv2.HOUGH_GRADIENT, 
+    #     dp=1, # was 1.2 
+    #     minDist=100,
+    #     param1=100, 
+    #     param2=40, # was 30 
+    #     minRadius=30, 
+    #     maxRadius=2000
+    # )
+
     circles = cv2.HoughCircles(
         img_blur, 
-        cv2.HOUGH_GRADIENT, 
-        dp=1, # was 1.2 
-        minDist=100,
-        param1=100, 
-        param2=40, # was 30 
-        minRadius=30, 
-        maxRadius=0
+        method, 
+        dp=dp, # was 1.2 
+        minDist=minDist,
+        param1=param1, 
+        param2=param2,
+        minRadius=minRadius, 
+        maxRadius=maxRadius
     )
 
-    if circles is not None:
-        circles = np.uint16(np.around(circles))
+    return circles
 
-        x, y, r = circles[0][0]
+
+def find_circle_center(img):
+
+
+    # if circles is not None:
+    #     circles = np.uint16(np.around(circles))
+
+    #     x, y, r = circles[0][0]
             
-        return int(x), int(y), int(r)
+    #     return int(x), int(y), int(r)
 
-    else:
-        return 500,500,5
+    # else:
+    #     return 500,500,5
 
-
+    return find_circle_center_parametrized(
+        img,
+        blur_width=5,
+        method=cv2.HOUGH_GRADIENT_ALT,
+        minDist=100,
+        param1=24,
+        param2=0.8,
+        minRadius=30,
+        maxRadius=2000 
+    )
 
 
 
@@ -51,7 +91,7 @@ def center_object_in_larger_image(image, x, y, target_size=2000):
 
     # print( f"dtype {image.dtype}")
     
-    H, W = image.shape[:2]
+    H, W = image.shape[:3]
     C = 1 # if image.ndim == 2 else image.shape[2]
 
     # Create output black image
@@ -71,7 +111,7 @@ def center_object_in_larger_image(image, x, y, target_size=2000):
     offset_y = center_target - y
     offset_x = center_target - x
 
-    # print( type( offset_y ) )
+    # print( type( offset_y ) )c
 
     # print( f"offset_y {offset_y}")
     # print( f"offset_x {offset_x}")

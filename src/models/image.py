@@ -66,3 +66,6 @@ class VoyagerImage(database.Base):
     IMAGE_VERTICAL_FOV_units = Column(String)
 
     IMAGE_REFLECTANCE_SCALING_FACTOR = Column(Float)
+
+    LOCAL_FILENAME = Column(String)
+    LOCAL_IMAGE_PICKLE_FN = Column(String)

@@ -6,94 +6,236 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    import sys
+    import os
+
+    sys.path.append("./")
+
     import marimo as mo
     import sqlite3, time, random
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import datetime
+    import vicar
+    import analysis
 
-    return mo, sqlite3, time
-
-
-@app.cell
-def _(mo, sqlite3, time):
-
-    with sqlite3.connect("file:////home/lobdellb/repos/voyager_flyby/cache/pipeline.db?mode=ro") as conn:
-        #conn.execute("PRAGMA journal_mode=WAL;")
-        #conn.execute("PRAGMA synchronous=NORMAL;")
-        #conn.execute("PRAGMA temp_store=MEMORY;")
-        # if 64-bit system and modern SQLite:
-        #conn.execute("PRAGMA mmap_size=268435456;")  # 256MB (optional)
-        #conn.execute("PRAGMA cache_size=-1048576;")  # ~1GB cache in pages (negative = KB)
-        #conn.execute("PRAGMA optimize;")
-
-        # make sure stats exist
-        #conn.execute("ANALYZE;")
-
-        cur = conn.cursor()
-
-        # get all product_ids or a lot
-
-        r_ids = cur.execute("select product_id from voyager_images").fetchall()
-        all_ids = [ r[0] for r in r_ids ]
-
-        # Use a prepared statement and avoid SELECT *
-        # sql = "SELECT * FROM voyager_images WHERE PRODUCT_ID=?;"
-
-        sql = """SELECT voyager_images."PDS_VERSION_ID", voyager_images."RECORD_TYPE", voyager_images."RECORD_BYTES", voyager_images."FILE_RECORDS", voyager_images."DATA_SET_ID", voyager_images."PRODUCT_ID", voyager_images."PRODUCT_CREATION_TIME", voyager_images."PRODUCT_TYPE", voyager_images."INSTRUMENT_HOST_NAME", voyager_images."INSTRUMENT_HOST_ID", voyager_images."INSTRUMENT_NAME", voyager_images."INSTRUMENT_ID", voyager_images."MISSION_PHASE_NAME", voyager_images."TARGET_NAME", voyager_images."IMAGE_ID", voyager_images."IMAGE_NUMBER", voyager_images."IMAGE_TIME", voyager_images."EARTH_RECEIVED_TIME", voyager_images."SCAN_MODE_ID", voyager_images."SHUTTER_MODE_ID", voyager_images."GAIN_MODE_ID", voyager_images."EDIT_MODE_ID", voyager_images."FILTER_NAME", voyager_images."FILTER_NUMBER", voyager_images."EXPOSURE_DURATION_value", voyager_images."EXPOSURE_DURATION_units", voyager_images."START_TIME", voyager_images."STOP_TIME", voyager_images."SPACECRAFT_CLOCK_START_COUNT", voyager_images."SPACECRAFT_CLOCK_STOP_COUNT", voyager_images."NOTE", voyager_images."VICAR_HEADER_HEADER_TYPE", voyager_images."VICAR_HEADER_BYTES", voyager_images."VICAR_HEADER_RECORDS", voyager_images."VICAR_HEADER_INTERCHANGE_FORMAT", voyager_images."IMAGE_LINES", voyager_images."IMAGE_LINE_SAMPLES", voyager_images."IMAGE_SAMPLE_TYPE", voyager_images."IMAGE_SAMPLE_BITS", voyager_images."IMAGE_SAMPLE_DISPLAY_DIRECTION", voyager_images."IMAGE_LINE_DISPLAY_DIRECTION", voyager_images."IMAGE_HORIZONTAL_PIXEL_FOV_value", voyager_images."IMAGE_HORIZONTAL_PIXEL_FOV_units", voyager_images."IMAGE_VERTICAL_PIXEL_FOV_value", voyager_images."IMAGE_VERTICAL_PIXEL_FOV_units", voyager_images."IMAGE_HORIZONTAL_FOV_value", voyager_images."IMAGE_HORIZONTAL_FOV_units", voyager_images."IMAGE_VERTICAL_FOV_value", voyager_images."IMAGE_VERTICAL_FOV_units", voyager_images."IMAGE_REFLECTANCE_SCALING_FACTOR" 
-    FROM voyager_images WHERE voyager_images."PRODUCT_ID" = ?"""
-
-
-        # ids = [f"C3517{i:03d}_GEOMED.IMG" for i in range(1000)]  # replace with real keys present
-
-        # # warm up
-        # for k in ids[:100]: cur.execute(sql, (k,)).fetchone()
-
-        # t0 = time.perf_counter()
-        # for k in ids:
-        #     cur.execute(sql, (k,)).fetchone()
-        # t1 = time.perf_counter()
-        # print(f"{len(ids)/(t1-t0):.0f} lookups/sec")
-
-        start_time = time.time()
-        for id in mo.status.progress_bar( all_ids ):
-            r = cur.execute(sql,( id ,)).fetchone()
-            if len(r) != 50:
-                raise Exception("what?")
-
-        end_time = time.time()
-
-        # r = cur.execute(sql,(k,)).fetchone()
-
-        print(f"took {(end_time-start_time)/len(all_ids):.6f}ms per item")
-    return (r,)
+    pd.set_option('display.max_rows', 100)
+    return analysis, datetime, np, pd, plt, sqlite3, vicar
 
 
 @app.cell
-def _(r):
-    r
+def _(pd, sqlite3):
+    fn = "/home/lobdellb/repos/voyager_flyby/cache/pipeline.db"
+
+    with sqlite3.connect( fn ) as conn:
+        # Step 2: Define your SQL query.
+        # This can be as simple or complex as needed.
+        sql_query = "SELECT * FROM voyager_images"
+
+        # Step 3: Load the query results into a pandas DataFrame.
+        df = pd.read_sql_query(sql_query, conn)
+
+        # Step 4: Display the DataFrame to verify the results.
+
+    print( df.shape )
+
+    df["one"] = 1
+    df
+    return (df,)
+
+
+@app.cell
+def _(df):
+    print( df.columns)
     return
 
 
 @app.cell
-def _(sqlite3):
-    with sqlite3.connect("file:////home/lobdellb/repos/voyager_flyby/cache/pipeline.db?mode=ro") as conn:
-        #conn.execute("PRAGMA journal_mode=WAL;")
-        #conn.execute("PRAGMA synchronous=NORMAL;")
-        #conn.execute("PRAGMA temp_store=MEMORY;")
-        # if 64-bit system and modern SQLite:
-        #conn.execute("PRAGMA mmap_size=268435456;")  # 256MB (optional)
-        #conn.execute("PRAGMA cache_size=-1048576;")  # ~1GB cache in pages (negative = KB)
-        #conn.execute("PRAGMA optimize;")
+def _(df):
+    # Let's see the proportion of wide vs narrow
 
-        # make sure stats exist
-        #conn.execute("ANALYZE;")
+    df.groupby("INSTRUMENT_NAME").count()["one"].reset_index()
+    return
 
-        cur = conn.cursor()
 
-        # get all product_ids or a lot
+@app.cell
+def _(df):
+    # Let's look at counts of distinct values
 
-        r = cur.execute("select * from voyager_images where product_id like 'C2783018%' ").fetchall()
+    high_card = [
+        "PRODUCT_ID",
+        "IMAGE_ID",
+        "IMAGE_NUMBER",
+        "IMAGE_TIME",
+        "EARTH_RECEIVED_TIME",
+        "START_TIME",  
+        "STOP_TIME",
+        "SPACECRAFT_CLOCK_START_COUNT",
+        "SPACECRAFT_CLOCK_STOP_COUNT",
+        "NOTE"
+    ]
 
-    r
-    return (r,)
+    low_card = []
+
+    for c in df.columns:
+
+        n = df[c].nunique()
+
+        if n > 1 and c not in high_card:
+            print( f"{c:40} --> {n}")
+            low_card.append( c )
+
+    relevant = high_card + low_card
+    print( low_card )
+    print( relevant )
+    return (low_card,)
+
+
+@app.cell
+def _(df, low_card):
+    # let's look at unique values on the interesting low cards
+
+    for c2 in low_card:
+
+        summary_df = df.groupby(c2).count()["one"].reset_index()
+
+        print("*"*100)
+        print( c2 )
+        print( summary_df )
+
+    # summary_df
+    return
+
+
+@app.cell
+def _(df, np):
+    # Let's look at the photo timing
+
+    start_time = np.array( list(filter( lambda s : s is not None, df["START_TIME"] ) ) )
+
+
+
+    # plt.bar( start_time, n )
+    return (start_time,)
+
+
+@app.cell
+def _(datetime, np, start_time):
+    def generate_windowed_avg( events ):
+
+        window = datetime.timedelta(hours=6)
+        time_increment = datetime.timedelta(hours=1)
+
+        events_dt = np.array([ datetime.datetime.fromisoformat(s) for s in events ])
+
+        earliest = ( min( events_dt ) )
+        latest = ( max( events_dt ) )
+
+        print( earliest )
+        print( latest )
+
+        try:
+            current_dt = earliest - window
+        except Exception as e:
+            print( earliest )
+            print( window )
+            print ( type( earliest ) )
+            print( type( window ) )
+            raise e
+
+        times = []
+        data = []
+
+        while current_dt < latest + window:
+
+            # print( current_dt )
+
+            this_val = sum( ( events_dt > current_dt ) & ( events_dt < current_dt + window ) )
+            data.append( this_val )
+            times.append( current_dt )
+
+            current_dt += time_increment 
+
+        return np.array(times),np.array(data) # [ np.datetime64(s) for s in data ]
+
+    times,data = generate_windowed_avg( start_time )
+    return data, times
+
+
+@app.cell
+def _(data, datetime, plt, times):
+
+    if "data" in locals():
+
+        plt.figure(figsize=(14,4))
+        # n3 = np.ones( len(data) )
+
+        p = plt.plot( times, data/6)
+        plt.xlim( [datetime.date(1980,8,18), datetime.date(1980,12,20) ])
+        plt.xticks(rotation=45)
+        plt.ylabel("photographs per hour")
+        plt.xlabel("date")
+        plt.title("Voyager 1 photographs per hour during the Saturn encounter")
+
+    p
+    return
+
+
+@app.cell
+def _(analysis, df, plt, vicar):
+    # Next let's look at some of the photos
+
+        # We need to do the scaled part here
+
+        # scaled = ( scale_image( v_im.array.squeeze() ) * 255 ).astype( np.uint8 )
+
+        # x,y,radius = find_circle_center( scaled ) 
+
+        # new_image = center_object_in_larger_image( scaled.astype( np.float64 ), x, y ).astype( np.uint8 )
+
+        # dim1, dim2, dim3 = new_image.shape
+
+        # new_image = np.stack([new_image]*3, axis=-1).reshape(dim1,dim2,3)
+
+    # rows, cols
+    fig, axes = plt.subplots(8, 5, figsize=(10, 15))
+
+    # Flatten the axes array for easy iteration
+    axes = axes.ravel()
+
+    # for i in range(16):
+    #     axes[i].imshow(images[i], cmap="gray")
+    #     axes[i].axis("off")  # Hide axes ticks
+
+
+
+
+    for n3,(i,r) in enumerate( df[ df.TARGET_NAME == "TETHYS"].iterrows() ):
+
+        if n3 > ( len(axes)-1 ):
+            break
+
+        v_im = vicar.VicarImage( r.LOCAL_FILENAME )
+
+        im = analysis.scale_image( v_im.array.squeeze() )
+
+        # print( n3 )
+        # plt.imshow( im , cmap="grey")
+
+        axes[n3].imshow( im, cmap="gray")
+        axes[n3].axis("off")  # Hide axes ticks
+
+
+    plt.tight_layout()
+    plt.show()
+    return (im,)
+
+
+@app.cell
+def _(im, plt):
+    plt.imshow( im , cmap="grey")
+    return
 
 
 @app.cell

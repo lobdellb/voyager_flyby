@@ -6,14 +6,17 @@ import logging
 import glob
 import itertools
 import pvl
+import vicar
 import json
+import pickle
+import sys
 
 import pipeline
 import helpers
 import config
 import database as db
 # from models.image import VoyagerImage
-from repository.image import upsert_image_metadata
+from repository.image import upsert_image_metadata , get_voyager_image_by_product_id
 
 
 logging.basicConfig(level=logging.INFO)
@@ -175,7 +178,7 @@ class LoadAndStoreMetadata(pipeline.Task):
     def __init__(self, name):
 
         super().__init__( name )
-        self.queries_per_transaction = 1
+        self.queries_per_transaction = 50
         self.current_queries = 0
 
 
@@ -186,7 +189,7 @@ class LoadAndStoreMetadata(pipeline.Task):
         self.current_queries += 1
 
         if self.current_queries >= self.queries_per_transaction:
-            # session.commit()
+            session.commit()
             self.current_queries = 0
 
         return rv
@@ -208,6 +211,99 @@ class LoadAndStoreMetadata(pipeline.Task):
             raise e
 
         return item
+
+
+
+class LoadVicarImageToPickle(pipeline.Task):
+
+    def __init__(self, name, cache_path ):
+
+        super().__init__( name )
+        self.queries_per_transaction = 50
+        self.current_queries = 0
+        self.cache_path = cache_path
+
+    def get_cache_fn( self, image_id ):
+
+        return self.cache_path / "pickled_images" / f"{image_id}_GEOMED.p"
+
+
+    def commit_occasionally(self,session ):
+
+        self.current_queries += 1
+
+        if self.current_queries >= self.queries_per_transaction:
+            session.commit()
+            self.current_queries = 0
+
+        return True
+
+
+    def process(self, item, session ):
+
+        # I want to
+        # - Generate the item's loaded pickle filename
+        # - Determine whehter it exists (ie., is in the database already)
+        #   - Load the vicar image, write it out as a pickle file in the local fs
+        #   - write the local pickle fn into the local fs
+        #   - write the local pickle fn into the database 
+
+
+        # Example filename: C3480032_GEOMED.IMG
+        # After extraction, image_id should be 'C3480032'
+
+
+        fn = item["local_file_path"]
+
+        image_id = helpers.extract_prefix_from_filename(fn)
+        product_id=f"{image_id}_GEOMED.IMG"
+
+        existing_image_record_obj = get_voyager_image_by_product_id(session, product_id )
+
+        if not existing_image_record_obj:
+            raise Exception(f"process: Found an image which doesn't exist in the database but should with record {item}")
+
+        if existing_image_record_obj.LOCAL_IMAGE_PICKLE_FN is None:
+
+            # load image
+
+            try:
+                v_im = vicar.VicarImage( existing_image_record_obj.LOCAL_FILENAME )
+
+                pickled_image_fn = self.get_cache_fn( image_id )
+
+                # save as pickle
+                with open( pickled_image_fn , "wb") as fp:
+                    pickle.dump(v_im, fp)
+
+                # update datebase
+                existing_image_record_obj.LOCAL_IMAGE_PICKLE_FN = str( pickled_image_fn )
+                self.commit_occasionally(session)
+            except Exception as ex:
+
+                logger.error(f"LoadVicarImageToPickle.process(): Failed to load {existing_image_record_obj.LOCAL_FILENAME}")
+                # raise ex
+
+        return item
+
+
+
+
+
+# Next, let's do just the find_circle_center part.
+
+    # scaled = ( scale_image( v_im.array.squeeze() ) * 255 ).astype( np.uint8 )
+
+    # x,y,radius = find_circle_center( scaled ) 
+    
+    # new_image = center_object_in_larger_image( scaled.astype( np.float64 ), x, y ).astype( np.uint8 )
+
+    # dim1, dim2, dim3 = new_image.shape
+
+    # new_image = np.stack([new_image]*3, axis=-1).reshape(dim1,dim2,3)
+
+
+
 
 
 
@@ -432,13 +528,27 @@ def main():
             loaded_lbl_list = [ load_and_store_metadata_obj.process(item, session) for item in tqdm.tqdm(lbl_list) ]
             session.commit()
 
-        # print( len( loaded_lbl_list))
-
         open( config.db_loaded_fn, 'w').close()
+
+
+    load_vicar_to_pickle_obj = LoadVicarImageToPickle( name="save_image_to_pickle", cache_path=config.cache_path )
+
+    with db.SessionLocal() as session:
+        pickled_img_list = [ load_vicar_to_pickle_obj.process(item, session) for item in tqdm.tqdm(img_list) ]
+        session.commit()
+
+    print( len( pickled_img_list))
+
+
+
 
 
 
 if __name__ == "__main__":
+
+    logger.info( f"Python path is: {sys.path}")
+    logger.info( f"System path is {os.getcwd()}" )
+
     main()
 
     from models.image import VoyagerImage
