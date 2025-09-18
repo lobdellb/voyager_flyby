@@ -162,17 +162,44 @@ def _(analysis, cProfile, cv2, datetime, df, io, np, pickle, plt, pstats):
             ( df.TARGET_NAME == "SATURN")
             & ( df.INSTRUMENT_NAME == "IMAGING SCIENCE SUBSYSTEM - NARROW ANGLE" )
             & ( df.START_TIME > datetime.datetime(1980,8,20)  )
-        ].sort_values("START_TIME").iloc[::50]
+        ].sort_values("START_TIME").iloc[::250]
+ 
+        print( f"these_df.shape is {these_df.shape}" )
 
+        blur_widths = [3,5,7]
+        methods = [
+                ( cv2.HOUGH_GRADIENT_ALT, 100, 0.9 ),
+                ( cv2.HOUGH_GRADIENT, 100, 40 ),
+            ]
 
+        param1s = [ 50, 100, 200, 400]
+    
+        circles_funcs = [
+            lambda im_prepped_for_cv2 : analysis.find_circle_center_parametrized(
+                    im_prepped_for_cv2,
+                    blur_width=5,
+                    method=cv2.HOUGH_GRADIENT_ALT,
+                    dp=1,
+                    minDist=50,
+                    param1=param1,
+                    param2=0.9,
+                    minRadius=25,
+                    maxRadius=0 
+                ) for param1 in param1s 
+        ]
 
-        print( these_df.shape )
-
+    
         # rows, cols
-        how_many_rows = int( np.ceil( these_df.shape[0] / 5 ) )
-        how_tall = 2* how_many_rows
-        fig, axes = plt.subplots( how_many_rows , 5, figsize=(10, how_tall))
+        # how_many_rows = int( np.ceil( these_df.shape[0] / 5 ) )
+        # how_tall = 2* how_many_rows
+        # fig, axes = plt.subplots( how_many_rows , 5, figsize=(10, how_tall))
 
+        cols = len( circles_funcs )
+    
+        how_many_rows = int( np.ceil( these_df.shape[0] ) )
+        how_tall = 2 * ( 5 / cols ) * how_many_rows
+        fig, axes = plt.subplots( how_many_rows , cols, figsize=(10, how_tall))
+    
         # Flatten the axes array for easy iteration
         axes = axes.ravel()
 
@@ -186,6 +213,7 @@ def _(analysis, cProfile, cv2, datetime, df, io, np, pickle, plt, pstats):
             (255, 255, 51),   # yellow
         ]
 
+        frame = 0
 
         for n3,(i,r) in enumerate( these_df.iterrows() ):
 
@@ -202,32 +230,26 @@ def _(analysis, cProfile, cv2, datetime, df, io, np, pickle, plt, pstats):
             im_prepped_for_cv2 = ( im * 255 ).astype( np.uint8 )
 
             # circles = analysis.find_circle_center( im_prepped_for_cv2 ) 
-            circles = analysis.find_circle_center_parametrized(
-                    im_prepped_for_cv2,
-                    blur_width=5,
-                    method=cv2.HOUGH_GRADIENT_ALT,
-                    dp=1,
-                    minDist=50,
-                    param1=300,
-                    param2=0.9,
-                    minRadius=25,
-                    maxRadius=0 
-                )
-
 
             dim1, dim2, dim3 = im.shape
             new_image = np.stack([im*255]*3, axis=-1).reshape(dim1,dim2,3).astype( np.uint8 )
+    
+            for circle_func in circles_funcs:
 
-            if circles is None:
-                # print("none")
-                pass
-            else:
+                circles = circle_func( im_prepped_for_cv2 )
 
-                # print( type( circles[0][0][0] ) )
 
-                # circles = np.uint16(np.around(circles))
-
-                circles = circles[0] # get the list of circles
+                if circles is None:
+                    # print("none")
+                    circles = []
+                else:
+                    circles = circles[0]
+                
+                if True:
+    
+                    # print( type( circles[0][0][0] ) )
+    
+                    # circles = np.uint16(np.around(circles))
 
                 # print( circles )
 
@@ -237,26 +259,17 @@ def _(analysis, cProfile, cv2, datetime, df, io, np, pickle, plt, pstats):
 
                 # print( len( circles ) ) 
 
-                for color_index,(x,y,radius) in enumerate( circles ):
+                    im_annotated = new_image
+                
+                    for color_index,(x,y,radius) in enumerate( circles ):
+    
+                    # x,y,radius = circles[0]
+                        color_index = min( len(colors_rgb)-1, color_index )
+                        im_annotated = cv2.circle(im_annotated, (int(x),int(y)), int(radius) , colors_rgb[ color_index ], 4 )
 
-                # x,y,radius = circles[0]
-                    color_index = min( len(colors_rgb)-1, color_index )
-                    im_annotated = cv2.circle(new_image, (int(x),int(y)), int(radius) , colors_rgb[ color_index ], 4 )
-                    pass
-
-            # print( x, y, radius )
-
-            # print( n3 )
-            # plt.imshow( im , cmap="grey")
-
-
-
-            # print( dim1, dim2, dim3 )
-
-
-
-            axes[n3].imshow( new_image, cmap="gray")
-
+                    axes[frame].imshow( im_annotated, cmap="gray")
+                    frame += 1
+        
         for a in axes:
             a.axis("off")  # Hide axes ticks
 
@@ -266,9 +279,9 @@ def _(analysis, cProfile, cv2, datetime, df, io, np, pickle, plt, pstats):
 
     s = io.StringIO()
     ps = pstats.Stats(pr, stream=s).sort_stats("cumulative")
-    ps.print_stats(10)   # top 10 results
+    ps.print_stats(20)   # top 10 results
     print(s.getvalue())
-    return (v_im,)
+    return axes, cols, how_many_rows, how_tall, these_df
 
 
 @app.cell
@@ -324,17 +337,33 @@ def _():
 
 
 @app.cell
-def _():
+def _(these_df):
+    these_df
     return
 
 
 @app.cell
-def _(pickle, v_im):
+def _(axes):
+    len(axes)
+    return
 
-    # v_im
 
-    with open("/home/lobdellb/garbage/my_data.pkl", "wb") as fp:
-        pickle.dump(v_im, fp)
+@app.cell
+def _(cols):
+    cols
+    return
+
+
+@app.cell
+def _(how_many_rows):
+    how_many_rows
+    return
+
+
+@app.cell
+def _(how_tall):
+    how_tall
+
     return
 
 
