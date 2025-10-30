@@ -10,12 +10,16 @@ def find_circle_center_parametrized(
         method: int,
         dp: float,
         minDist:float,
-        param1:float = 100,
-        param2:float = 100,
+        # param1:float = 100,
+        # param2:float = 100,
+        param1:float = 50,  # best combo I could come up with
+        param2:float = 44,
         minRadius:int = 0,
-        maxRadius:int = 0 
+        maxRadius:int = 0,
     ):
     
+    # print( f"method is {( method, param1, param2 )}" )
+
     # img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     img_blur = cv2.medianBlur(img, blur_width)
 
@@ -69,6 +73,14 @@ def find_circle_center(img):
         minRadius=30,
         maxRadius=2000 
     )
+
+
+
+def prep_impage_for_cv2( im ):
+
+    dim1, dim2, dim3 = im.shape
+    prepared_im = ( im * 255 ).astype( np.uint8 )
+    return prepared_im
 
 
 

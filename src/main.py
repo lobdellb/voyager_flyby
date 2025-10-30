@@ -10,8 +10,12 @@ import vicar
 import json
 import pickle
 import sys
+import time
+
+import cv2
 
 import pipeline
+import analysis
 import helpers
 import config
 import database as db
@@ -290,6 +294,119 @@ class LoadVicarImageToPickle(pipeline.Task):
 
 
 
+
+
+class ComputeAndStoreJupyterCenters(pipeline.Task):
+
+    def __init__(self, name, cache_path ):
+
+        super().__init__( name )
+        self.queries_per_transaction = 50
+        self.current_queries = 0
+        self.cache_path = cache_path
+
+
+    def commit_occasionally(self,session ):
+
+        self.current_queries += 1
+
+        if self.current_queries >= self.queries_per_transaction:
+            session.commit()
+            self.current_queries = 0
+
+        return True
+
+
+    def process(self, item, session ):
+
+        # I want to
+        # - Select all work items which do not have a value for the circle center
+        # - Load a pickle file
+        # - Run the circle transform on images
+        # - Store in the database
+
+        fn = item["local_file_path"]
+
+        # TODO: centralize the logic here resulting in product_id
+        image_id = helpers.extract_prefix_from_filename(fn)
+        product_id=f"{image_id}_GEOMED.IMG"
+
+        existing_image_record_obj = get_voyager_image_by_product_id(session, product_id )
+
+        if not existing_image_record_obj:
+            raise Exception(f"process: Found an image which doesn't exist in the database but should with record {item}")
+
+        if existing_image_record_obj.BEST_CIRCLE_X is not None:
+            return item
+
+        try:
+
+            pickled_image_fn = existing_image_record_obj.LOCAL_IMAGE_PICKLE_FN
+            with open( pickled_image_fn , "rb") as fp:
+                v_im = pickle.load( fp )
+
+            # There are options here as well to improve circling
+            im = analysis.scale_image( v_im.array.squeeze() )
+
+            # print( f"{pickled_image_fn} - {type(im)}")
+
+            im_prepped_for_cv2 = analysis.prep_impage_for_cv2( im )
+
+            # best performing: p1=50, p2=44, blur_width=5, cv2.HOUGH_GRADIENT
+
+            start_time = time.time()
+            circles = analysis.find_circle_center_parametrized(
+                im_prepped_for_cv2,
+                blur_width=5,
+                method=cv2.HOUGH_GRADIENT,
+                dp=1,
+                minDist=50,
+                param1=50,
+                param2=44,
+                minRadius=25,
+                maxRadius=0
+            )
+            elapsed_time = time.time() - start_time
+
+            if circles is None:
+                # print("none")
+                the_circles = []
+            else:
+                the_circles = circles[0]
+
+                circle = the_circles[0]
+
+                existing_image_record_obj.BEST_CIRCLE_X = int(circle[0])
+                existing_image_record_obj.BEST_CIRCLE_Y = int(circle[1])
+                existing_image_record_obj.ALL_CIRCLES = json.dumps(  [c.tolist() for c in the_circles] )
+                existing_image_record_obj.CIRCLE_TIME = elapsed_time
+                self.commit_occasionally(session)
+
+                # print(f"{type(circle)} - {len(circles)} - {circle} - {im_prepped_for_cv2.shape} - {elapsed_time}"  )
+                
+
+        except Exception as ex:
+
+            # logger.error(f"Exception {ex} while circlizing {product_id}")
+
+            # print( im_prepped_for_cv2 )
+            # print( type( im_prepped_for_cv2 ) )
+            # print( im_prepped_for_cv2.shape )
+            print( pickled_image_fn )
+
+            # raise ex
+
+        return item
+
+
+        # new_image = center_object_in_larger_image( scaled.astype( np.float64 ), x, y ).astype( np.uint8 )
+
+
+
+
+
+
+
 # Next, let's do just the find_circle_center part.
 
     # scaled = ( scale_image( v_im.array.squeeze() ) * 255 ).astype( np.uint8 )
@@ -532,12 +649,19 @@ def main():
 
 
     load_vicar_to_pickle_obj = LoadVicarImageToPickle( name="save_image_to_pickle", cache_path=config.cache_path )
-
     with db.SessionLocal() as session:
         pickled_img_list = [ load_vicar_to_pickle_obj.process(item, session) for item in tqdm.tqdm(img_list) ]
         session.commit()
 
     print( len( pickled_img_list))
+    print( "Kicking off compute_and_store_centers ")
+
+    compute_and_store_centers_obj = ComputeAndStoreJupyterCenters( name="compute_and_store_centers", cache_path=config.cache_path )
+    with db.SessionLocal() as session:
+        circled_img_list = [ compute_and_store_centers_obj.process(item, session) for item in tqdm.tqdm( pickled_img_list ) ]
+        session.commit()
+
+
 
 
 

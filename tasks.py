@@ -120,4 +120,20 @@ def marimo_tune_hough_detection(c):
     print(f"Marimoing {fn} ...")
 
     with c.cd("./src"):
+        os.environ["MARIMO_OUTPUT_MAX_BYTES"] = "10_000_000"
+        c.run(f"source ../{env_activate_fn} && marimo edit ../{fn}", pty=True )
+
+
+
+@task(create_dev_env)
+def marimo_examine_circle_data(c):
+
+    check_cwd()
+
+    fn ="notebooks/examine_circle_data.py"
+
+    print(f"Marimoing {fn} ...")
+
+    with c.cd("./src"):
+        os.environ["MARIMO_OUTPUT_MAX_BYTES"] = "10_000_000"
         c.run(f"source ../{env_activate_fn} && marimo edit ../{fn}", pty=True )

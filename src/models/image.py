@@ -69,3 +69,7 @@ class VoyagerImage(database.Base):
 
     LOCAL_FILENAME = Column(String)
     LOCAL_IMAGE_PICKLE_FN = Column(String)
+    BEST_CIRCLE_X = Column(Integer)
+    BEST_CIRCLE_Y = Column(Integer)
+    ALL_CIRCLES = Column(String)
+    CIRCLE_TIME = Column(Float)
