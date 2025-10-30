@@ -1,27 +1,22 @@
+from __future__ import annotations
 
-import os
-import pickle
-import tqdm
-import logging
-import glob
-import itertools
-import pvl
-import vicar
 import json
-import pickle
-import sys
+import logging
+import os
+import pathlib
+import tarfile
 import time
+from typing import Dict, Iterable
 
 import cv2
+import vicar
 
-import pipeline
 import analysis
-import helpers
 import config
+import helpers
+import pipeline
 import database as db
-# from models.image import VoyagerImage
-from repository.image import upsert_image_metadata , get_voyager_image_by_product_id
-
+from repository.image import get_voyager_image_by_product_id, upsert_image_metadata
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,671 +24,330 @@ logger = logging.getLogger(__name__)
 db.Base.metadata.create_all(bind=db.engine)
 
 
-# Steps I need 
-# - Open all tar files, extract relevant metadata and images, cache them in the local fs
-# - Extract and store metadata of interest 
-# - Link everything related by an ID
-# - Load images and cache them
-
-
 class ListTarFiles(pipeline.Task):
+    """Enumerate raw Voyager tar archives."""
 
-    def __init__(self, name, source_path):
+    def __init__(self, source_path: pathlib.Path):
+        super().__init__(name="list_tar_files")
+        self.source_path = pathlib.Path(source_path)
 
-        super().__init__(name=name)
-        self.source_path = source_path
-
-    def process(self,item ):
-        import glob
-
-        for g in glob.iglob(f"{self.source_path}/*.tar.gz"):
+    def produce_items(self, context: pipeline.StageContext) -> Iterable[Dict[str, str]]:
+        for tar_path in sorted(self.source_path.glob("*.tar.gz")):
+            stats = tar_path.stat()
             yield {
-                "tar_file_path": g,
-                "stem": helpers.extract_stem(g)
+                "tar_file_path": str(tar_path),
+                "stem": helpers.extract_stem(tar_path),
+                "size": stats.st_size,
+                "mtime": stats.st_mtime,
             }
 
+    def item_key(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return item["stem"]
+
+    def item_input_hash(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return pipeline.stable_hash({
+            "path": item["tar_file_path"],
+            "size": item["size"],
+            "mtime": item["mtime"],
+        })
 
 
-class ExtractTarfile(pipeline.Task):
+class ExtractTarMembers(pipeline.Task):
+    """Extract the individual VICAR label and image files from tarballs."""
 
-    def __init__(self, name, cache_path):
+    def __init__(self, cache_path: pathlib.Path):
+        super().__init__(name="extract_tar_members", depends_on=("list_tar_files",))
+        self.cache_path = pathlib.Path(cache_path)
+        self.members_root = self.cache_path / "tar_members"
+        self.members_root.mkdir(parents=True, exist_ok=True)
 
-        super().__init__( name )
+    def produce_items(self, context: pipeline.StageContext):
+        for tar_artifact in context.store.artifacts_for("list_tar_files"):
+            tar_path = pathlib.Path(tar_artifact.payload["tar_file_path"])
+            stem = tar_artifact.payload["stem"]
+            with tarfile.open(tar_path, "r") as tar:
+                for member in tar.getmembers():
+                    description = self._describe_member(tar_path, stem, member)
+                    if not description:
+                        continue
+                    description["upstream_hash"] = tar_artifact.input_hash
+                    yield description
 
-        self.cache_path = cache_path
+    def item_key(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return item["member_name"]
 
-        self.cached_files_list = self._get_cache_file_list()
-        logger.info( f"cached files list has {len(self.cached_files_list)} entries" )
+    def item_input_hash(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return pipeline.stable_hash({
+            "tar": item["tar_file_path"],
+            "member": item["member_name"],
+            "size": item["member_size"],
+            "mtime": item["member_mtime"],
+        })
 
-        # print( self.cached_files_list)
-        # raise Exception("stop")
+    def process(self, context: pipeline.StageContext, work_item: pipeline.WorkItem):
+        data = work_item.data
+        local_path = pathlib.Path(data["local_file_path"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _parse_member_name(self, member_info ):
-        import pathlib
+        should_extract = not local_path.exists()
+        if work_item.artifact and work_item.artifact.input_hash != work_item.input_hash:
+            should_extract = True
+        if local_path.exists() and local_path.stat().st_size != data["member_size"]:
+            should_extract = True
 
-        member_name = member_info.get_info()["name"]
-        inner_p = pathlib.Path( member_name )
-        inner_suffix = inner_p.suffix.replace(".","")
-        inner_stem = inner_p.stem
+        if should_extract:
+            with tarfile.open(data["tar_file_path"], "r") as tar:
+                member = tar.getmember(data["member_name"])
+                tar.extract(member, path=self.members_root)
 
+        data["local_file_path"] = str(local_path)
+        return data
+
+    def result_payload(self, context: pipeline.StageContext, work_item: pipeline.WorkItem, result):
+        return result
+
+    def _describe_member(self, tar_path: pathlib.Path, stem: str, member: tarfile.TarInfo):
+        member_name = member.name
+        inner_path = pathlib.Path(member_name)
+        suffix = inner_path.suffix.replace(".", "")
+        inner_stem = inner_path.stem
         if "_" in inner_stem:
-            image_id, image_type = inner_stem.split("_")[0], inner_stem.split("_")[1]
+            image_id, image_type = inner_stem.split("_", 1)
         else:
-            image_id = None
-            image_type = None
+            image_id, image_type = None, None
 
+        if not self._should_keep(member_name, stem, suffix, image_type):
+            return None
+
+        local_file_path = self.members_root / member_name
+        product_id = f"{image_id}_GEOMED.IMG" if image_id else inner_path.name
         return {
-            "stem": inner_stem,
-            "image_type": image_type,
-            "suffix": inner_suffix,
-            "image_id": image_id,
+            "tar_file_path": str(tar_path),
+            "stem": stem,
             "member_name": member_name,
-            "member_info" : member_info
+            "member_size": member.size,
+            "member_mtime": member.mtime,
+            "suffix": suffix,
+            "image_id": image_id,
+            "image_type": image_type,
+            "product_id": product_id,
+            "local_file_path": str(local_file_path),
         }
-    
 
-
-    def _filter_tar_members(self, member_dict, stem):
-
-        inner_path = f"{stem}/DATA/"
-
-        return member_dict["member_name"].startswith(inner_path) \
-            and member_dict["suffix"] in ["IMG","LBL"] \
-            and member_dict["image_type"] == "GEOMED"
-
-
-
-    def _get_members_info_file(self, tar, stem ):
-
-        tar_file_info_file = f"{self.cache_path}/member_info/memberinfo_{stem}.p"
-
-        if not os.path.isfile( tar_file_info_file ):
-        
-            all_tar_file_members = tar.getmembers()
-        
-            with open(tar_file_info_file, 'wb') as fp:
-                pickle.dump(all_tar_file_members, fp)
-
-        else:
-            with open(tar_file_info_file, 'rb') as fp:
-                all_tar_file_members = pickle.load(fp)      
-
-        return all_tar_file_members
-
-
-    def _get_cache_file_list(self) -> dict:
-
-        import glob
-
-        cache_file_list = glob.glob( str( self.cache_path / "tar_members" / "**" ), recursive=True)
-
-        if len(cache_file_list) == 0:
-            os.makedirs( self.cache_path / "tar_members", exist_ok=True)
-
-        return { g:True for g in cache_file_list }
-
-
-
-    def process(self, item ):
-        import tarfile
-
-        # print( item )
-
-        tar_file_path = item["tar_file_path"]
-        tar_stem = item["stem"]
-
-
-        
-        with tarfile.open( tar_file_path, "r") as tar:
-            all_tar_file_members = self._get_members_info_file( tar, tar_stem )
-
-            parsed_member_info = [ self._parse_member_name(mi) for mi in all_tar_file_members ]
-
-            logger.info( f"--- working on tar file {tar_file_path} with length {len(parsed_member_info)} ---" )
-
-            for n, member_dict in enumerate( tqdm.tqdm( parsed_member_info) ):
-
-                if self._filter_tar_members(member_dict,tar_stem):
-
-                    local_full_path = self.cache_path / "tar_members"
-
-                    # if not os.path.isfile( local_full_path ):
-                    
-                    local_full_fn = local_full_path / member_dict["member_info"].get_info()["name"]
-
-                    # print( self.cached_files_list )
-                    # print( local_full_fn)
-                    # print( not local_full_fn in self.cached_files_list )
-
-                    if not str( local_full_fn ) in self.cached_files_list:
-                        # print("extractnig")
-                        # raise Exception("stop")
-                        tar.extract( member_dict["member_info"], path=local_full_path )  
-                        pass
-
-                    member_dict["local_file_path"] = local_full_fn
-
-                    yield member_dict
-
+    def _should_keep(self, member_name: str, stem: str, suffix: str, image_type: str | None) -> bool:
+        return (
+            member_name.startswith(f"{stem}/DATA/")
+            and suffix in {"IMG", "LBL"}
+            and image_type == "GEOMED"
+        )
 
 
 class LoadAndStoreMetadata(pipeline.Task):
+    """Load PVL label files into the Voyager images table."""
 
-    def __init__(self, name):
+    def __init__(self):
+        super().__init__(name="load_and_store_metadata", depends_on=("extract_tar_members",))
 
-        super().__init__( name )
-        self.queries_per_transaction = 50
-        self.current_queries = 0
+    def produce_items(self, context: pipeline.StageContext):
+        for artifact in context.store.artifacts_for("extract_tar_members"):
+            payload = artifact.payload
+            if payload.get("suffix") != "LBL":
+                continue
+            enriched = dict(payload)
+            enriched["upstream_hash"] = artifact.input_hash
+            yield enriched
 
+    def item_key(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return item["product_id"]
 
-    def upsert_image_metadata(self,session, product_id, fn ):
+    def item_input_hash(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return pipeline.stable_hash({"label_hash": item["upstream_hash"]})
 
-        rv = upsert_image_metadata(session, product_id=product_id, fn=fn )   
-
-        self.current_queries += 1
-
-        if self.current_queries >= self.queries_per_transaction:
-            session.commit()
-            self.current_queries = 0
-
-        return rv
-
-
-    def process(self, item, session ):
-        
-        fn = item["local_file_path"]
-
-        image_id = helpers.extract_prefix_from_filename(fn)
-
-        # Example filename: C3480032_GEOMED.IMG
-        # After extraction, image_id should be 'C3480032'
-
-        try:
-            self.upsert_image_metadata(session, product_id=f"{image_id}_GEOMED.IMG", fn=fn )     
-        except Exception as e:
-            print( f"{image_id}_GEOMED.IMG" )
-            raise e
-
-        return item
-
+    def process(self, context: pipeline.StageContext, work_item: pipeline.WorkItem):
+        local_path = work_item.data["local_file_path"].replace(".IMG", ".LBL")
+        product_id = work_item.data["product_id"]
+        upsert_image_metadata(context.session, product_id=product_id, fn=local_path)
+        return {"product_id": product_id, "label_path": local_path}
 
 
 class LoadVicarImageToPickle(pipeline.Task):
+    """Persist VICAR images to local pickle files for faster downstream access."""
 
-    def __init__(self, name, cache_path ):
+    def __init__(self, cache_path: pathlib.Path, commit_every: int = 50):
+        super().__init__(
+            name="load_vicar_to_pickle",
+            depends_on=("extract_tar_members", "load_and_store_metadata"),
+        )
+        self.cache_path = pathlib.Path(cache_path)
+        self.commit_every = commit_every
+        self._since_commit = 0
+        (self.cache_path / "pickled_images").mkdir(parents=True, exist_ok=True)
 
-        super().__init__( name )
-        self.queries_per_transaction = 50
-        self.current_queries = 0
-        self.cache_path = cache_path
+    def produce_items(self, context: pipeline.StageContext):
+        for artifact in context.store.artifacts_for("extract_tar_members"):
+            payload = artifact.payload
+            if payload.get("suffix") != "IMG":
+                continue
+            enriched = dict(payload)
+            enriched["upstream_hash"] = artifact.input_hash
+            yield enriched
 
-    def get_cache_fn( self, image_id ):
+    def item_key(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return item["product_id"]
 
-        return self.cache_path / "pickled_images" / f"{image_id}_GEOMED.p"
+    def item_input_hash(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return pipeline.stable_hash({"image_hash": item["upstream_hash"]})
 
+    def process(self, context: pipeline.StageContext, work_item: pipeline.WorkItem):
+        product_id = work_item.data["product_id"]
+        image_record = get_voyager_image_by_product_id(context.session, product_id)
+        if not image_record:
+            raise ValueError(f"Image metadata for {product_id} must exist before loading pickles")
 
-    def commit_occasionally(self,session ):
+        image_id = helpers.extract_prefix_from_filename(product_id)
+        pickle_path = self.cache_path / "pickled_images" / f"{image_id}_GEOMED.p"
 
-        self.current_queries += 1
+        needs_generation = not pickle_path.exists()
+        if work_item.artifact and work_item.artifact.input_hash != work_item.input_hash:
+            needs_generation = True
+        if pickle_path.exists() and pickle_path.stat().st_size == 0:
+            needs_generation = True
 
-        if self.current_queries >= self.queries_per_transaction:
-            session.commit()
-            self.current_queries = 0
+        if needs_generation:
+            v_im = vicar.VicarImage(image_record.LOCAL_FILENAME)
+            with open(pickle_path, "wb") as fp:
+                import pickle
 
-        return True
+                pickle.dump(v_im, fp)
 
+            image_record.LOCAL_IMAGE_PICKLE_FN = str(pickle_path)
+            self._since_commit += 1
+            if self._since_commit >= self.commit_every:
+                context.session.commit()
+                self._since_commit = 0
+        elif image_record.LOCAL_IMAGE_PICKLE_FN != str(pickle_path):
+            image_record.LOCAL_IMAGE_PICKLE_FN = str(pickle_path)
+            self._since_commit += 1
+            if self._since_commit >= self.commit_every:
+                context.session.commit()
+                self._since_commit = 0
 
-    def process(self, item, session ):
+        return {
+            "product_id": product_id,
+            "pickle_path": str(pickle_path),
+        }
 
-        # I want to
-        # - Generate the item's loaded pickle filename
-        # - Determine whehter it exists (ie., is in the database already)
-        #   - Load the vicar image, write it out as a pickle file in the local fs
-        #   - write the local pickle fn into the local fs
-        #   - write the local pickle fn into the database 
-
-
-        # Example filename: C3480032_GEOMED.IMG
-        # After extraction, image_id should be 'C3480032'
-
-
-        fn = item["local_file_path"]
-
-        image_id = helpers.extract_prefix_from_filename(fn)
-        product_id=f"{image_id}_GEOMED.IMG"
-
-        existing_image_record_obj = get_voyager_image_by_product_id(session, product_id )
-
-        if not existing_image_record_obj:
-            raise Exception(f"process: Found an image which doesn't exist in the database but should with record {item}")
-
-        if existing_image_record_obj.LOCAL_IMAGE_PICKLE_FN is None:
-
-            # load image
-
-            try:
-                v_im = vicar.VicarImage( existing_image_record_obj.LOCAL_FILENAME )
-
-                pickled_image_fn = self.get_cache_fn( image_id )
-
-                # save as pickle
-                with open( pickled_image_fn , "wb") as fp:
-                    pickle.dump(v_im, fp)
-
-                # update datebase
-                existing_image_record_obj.LOCAL_IMAGE_PICKLE_FN = str( pickled_image_fn )
-                self.commit_occasionally(session)
-            except Exception as ex:
-
-                logger.error(f"LoadVicarImageToPickle.process(): Failed to load {existing_image_record_obj.LOCAL_FILENAME}")
-                # raise ex
-
-        return item
-
-
-
-
-
+    def on_stage_completed(self, context: pipeline.StageContext) -> None:
+        if self._since_commit:
+            context.session.commit()
+            self._since_commit = 0
 
 
 class ComputeAndStoreJupyterCenters(pipeline.Task):
-
-    def __init__(self, name, cache_path ):
-
-        super().__init__( name )
-        self.queries_per_transaction = 50
-        self.current_queries = 0
-        self.cache_path = cache_path
-
-
-    def commit_occasionally(self,session ):
-
-        self.current_queries += 1
-
-        if self.current_queries >= self.queries_per_transaction:
-            session.commit()
-            self.current_queries = 0
-
-        return True
-
-
-    def process(self, item, session ):
-
-        # I want to
-        # - Select all work items which do not have a value for the circle center
-        # - Load a pickle file
-        # - Run the circle transform on images
-        # - Store in the database
-
-        fn = item["local_file_path"]
-
-        # TODO: centralize the logic here resulting in product_id
-        image_id = helpers.extract_prefix_from_filename(fn)
-        product_id=f"{image_id}_GEOMED.IMG"
-
-        existing_image_record_obj = get_voyager_image_by_product_id(session, product_id )
-
-        if not existing_image_record_obj:
-            raise Exception(f"process: Found an image which doesn't exist in the database but should with record {item}")
-
-        if existing_image_record_obj.BEST_CIRCLE_X is not None:
-            return item
-
-        try:
-
-            pickled_image_fn = existing_image_record_obj.LOCAL_IMAGE_PICKLE_FN
-            with open( pickled_image_fn , "rb") as fp:
-                v_im = pickle.load( fp )
-
-            # There are options here as well to improve circling
-            im = analysis.scale_image( v_im.array.squeeze() )
-
-            # print( f"{pickled_image_fn} - {type(im)}")
-
-            im_prepped_for_cv2 = analysis.prep_impage_for_cv2( im )
-
-            # best performing: p1=50, p2=44, blur_width=5, cv2.HOUGH_GRADIENT
-
-            start_time = time.time()
-            circles = analysis.find_circle_center_parametrized(
-                im_prepped_for_cv2,
-                blur_width=5,
-                method=cv2.HOUGH_GRADIENT,
-                dp=1,
-                minDist=50,
-                param1=50,
-                param2=44,
-                minRadius=25,
-                maxRadius=0
-            )
-            elapsed_time = time.time() - start_time
-
-            if circles is None:
-                # print("none")
-                the_circles = []
-            else:
-                the_circles = circles[0]
-
-                circle = the_circles[0]
-
-                existing_image_record_obj.BEST_CIRCLE_X = int(circle[0])
-                existing_image_record_obj.BEST_CIRCLE_Y = int(circle[1])
-                existing_image_record_obj.ALL_CIRCLES = json.dumps(  [c.tolist() for c in the_circles] )
-                existing_image_record_obj.CIRCLE_TIME = elapsed_time
-                self.commit_occasionally(session)
-
-                # print(f"{type(circle)} - {len(circles)} - {circle} - {im_prepped_for_cv2.shape} - {elapsed_time}"  )
-                
-
-        except Exception as ex:
-
-            # logger.error(f"Exception {ex} while circlizing {product_id}")
-
-            # print( im_prepped_for_cv2 )
-            # print( type( im_prepped_for_cv2 ) )
-            # print( im_prepped_for_cv2.shape )
-            print( pickled_image_fn )
-
-            # raise ex
-
-        return item
-
-
-        # new_image = center_object_in_larger_image( scaled.astype( np.float64 ), x, y ).astype( np.uint8 )
-
-
-
-
-
-
-
-# Next, let's do just the find_circle_center part.
-
-    # scaled = ( scale_image( v_im.array.squeeze() ) * 255 ).astype( np.uint8 )
-
-    # x,y,radius = find_circle_center( scaled ) 
-    
-    # new_image = center_object_in_larger_image( scaled.astype( np.float64 ), x, y ).astype( np.uint8 )
-
-    # dim1, dim2, dim3 = new_image.shape
-
-    # new_image = np.stack([new_image]*3, axis=-1).reshape(dim1,dim2,3)
-
-
-
-
-
-
-
-# class ExtractTarMembers(pipeline.Task):
-
-#     def __init__(self, name, cache_path):
-
-#         super().__init__( name )
-
-#         self.cache_path = cache_path
-
-
-#     def should_extract( self, member_info ) -> bool:
-#         pass
-
-
-
-#     def process(self, item ):
-#         import tarfile
-
-#         all_tar_file_members = item["all_tar_file_members"]
-#         stem = item["stem"]
-#         tar_file_info_file = item["tar_file_info_file"]
-
-        
-
-
-# class ExtractMetadata(pipeline.Task):
-
-#     def __init__(self, name, cache_path):
-
-#         super().__init__( name )
-
-#         self.cache_path = cache_path
-
-#         self.cached_files_list = self._get_cache_file_list()
-#         logger.info( f"cached files list has {len(self.cached_files_list)} entries" )
-
-
-
-#                             if inner_suffix == "LBL":
-
-#                                 with open( local_full_path ) as fp:
-#                                     metadata = pvl.loads( fp.read() )
-        
-#                                 this_metadata = { **r, 
-#                                     **{
-#                                         "image_time": metadata["IMAGE_TIME"],
-#                                         "filter_name": metadata["FILTER_NAME"],
-#                                         "filter_number": metadata["FILTER_NUMBER"],
-#                                         "instrument_name": metadata["INSTRUMENT_NAME"],
-#                                         "gain_mode_id": metadata["GAIN_MODE_ID"],
-#                                         "target_name": metadata["TARGET_NAME"],
-#                                         "exposure_duration": metadata["EXPOSURE_DURATION"],
-#                                     }
-#                                 }
-                                
-#                                 metadata_lbl.append( this_metadata )       
-
-
-
-
-
-
-# metadata_lbl = []
-# metadata_img = []
-
-#         if len( circles ) == 0:
-#             circles = [[[500, 500, 5 ]]]
-# m = 0
-
-# all_tar_files = glob.glob(f"{data_path}VGISS_61*.tar.gz")
-
-# for tar_file_cnt, g in enumerate( all_tar_files ):
-
-#     print(f"loading file {tar_file_cnt}/{len(all_tar_files)}")
-    
-#     p = pathlib.Path( g )
-
-#     stem = p.stem.replace(".tar","")
-
-#     print( f"{g} / {stem}" )
-
-#     with tarfile.open( g, "r") as tar:
-
-#         # only re-read the tar index (time consuming) if we must
-        
-#         tar_file_info_file = f"{local_landing_path}memberinfo_{stem}.p"
-
-#         if not os.path.isfile( tar_file_info_file ):
-#             all_tar_file_members = tar.getmembers()
-        
-#             with open(tar_file_info_file, 'wb') as fp:
-#                 pickle.dump(all_tar_file_members, fp)
-
-#         else:
-#             with open(tar_file_info_file, 'rb') as fp:
-#                 all_tar_file_members = pickle.load(fp)      
-
-            
-        
-#         for n,member_info in enumerate( tqdm.tqdm( all_tar_file_members, position=0, leave=True) ):
-
-#             member_name = member_info.get_info()["name"]
-            
-#             inner_path = f"{stem}/DATA/"
-            
-#             if member_name.startswith( inner_path ):
-
-#                 inner_p = pathlib.Path( member_name )
-            
-#                 inner_suffix = inner_p.suffix.replace(".","")
-#                 inner_stem = inner_p.stem
-            
-#                 if not member_info.isdir():
-                    
-#                     if "_" not in inner_stem:
-#                         raise Exception(f"found non-conforming filename : {stem} " )
-                
-#                     else:
-
-#                         if "GEOMED" in inner_stem and inner_suffix in ["IMG","LBL"]:
-                            
-#                             id = inner_stem.split("_")[0]
-#                             the_type = inner_stem.split("_")[1]
-                        
-#                             r = {
-#                                 "stem": inner_stem,
-#                                 "type": the_type,
-#                                 "suffix": inner_suffix,
-#                                 "id": id,
-#                                 "fn": member_name,
-#                                 "tar_fn": g,
-#                             }
-
-#                             # extract the file if necessary
-#                             local_full_path = f"{local_landing_path}{member_name}"
-
-#                             if not os.path.isfile( local_full_path ):
-#                                 tar.extract( member_info, path=local_landing_path )  
-                            
-
-#                             if inner_suffix == "LBL":
-
-#                                 with open( local_full_path ) as fp:
-#                                     metadata = pvl.loads( fp.read() )
-        
-#                                 this_metadata = { **r, 
-#                                     **{
-#                                         "image_time": metadata["IMAGE_TIME"],
-#                                         "filter_name": metadata["FILTER_NAME"],
-#                                         "filter_number": metadata["FILTER_NUMBER"],
-#                                         "instrument_name": metadata["INSTRUMENT_NAME"],
-#                                         "gain_mode_id": metadata["GAIN_MODE_ID"],
-#                                         "target_name": metadata["TARGET_NAME"],
-#                                         "exposure_duration": metadata["EXPOSURE_DURATION"],
-#                                     }
-#                                 }
-                                
-#                                 metadata_lbl.append( this_metadata )                                    
-
-#                             elif inner_suffix == "IMG":
-                            
-#                                 v_im = vicar.VicarImage( local_full_path )
-
-#                                 fn_stem = member_name.replace(".IMG","").replace("/","_")
-                                
-#                                 out_jpg_fn = f"{output_images}jpg/{fn_stem}.jpg"
-#                                 out_p_fn = f"{output_images}pickle/{fn_stem}.p"
-
-#                                 norm_and_save_grey_image( v_im.array, out_jpg_fn )
-                                
-#                                 # normed_arr = normalize_clip( v_im.array, in_min=v_im.array.min() , in_max=v_im.array.max() )
-
-#                                 # dim1 = normed_arr.shape[1]
-#                                 # dim2 = normed_arr.shape[2]
-
-#                                 metadata_img.append( r )
-                                
-#                                 # plt.imsave( out_jpg_fn,
-#                                 #     np.stack([normed_arr]*3, axis=-1).reshape(dim1,dim2,3),
-#                                 #     cmap="grey"
-#                                 #           )
-
-#                                 with open( out_p_fn, "wb" ) as fp:
-#                                     pickle.dump(v_im.array, fp)
-                                    
-                            
-#                             else:
-#                                 raise Exception(f"weird file with no known suffix, {r}")    
-#     break                            
-
-
-
-
-
-def main():
-
-    # p = pipeline.Pipeline()
-
-    list_files_result = list( ListTarFiles( name="list_tars", source_path=config.source_path ).process([1]) )
-
-    extract_tar_file_obj = ExtractTarfile( name="list_tar_members", cache_path=config.cache_path )
-
-    extract_files_result = list( itertools.chain.from_iterable([ list(extract_tar_file_obj.process(item)) for item in list_files_result ]) )
-
-    lbl_list = [ item for item in extract_files_result if item["member_name"].endswith(".LBL") ]
-    img_list = [ item for item in extract_files_result if item["member_name"].endswith(".IMG") ]
-
-    # print( lbl_list[:50] )
-
-    logger.info( f"Found {len(lbl_list)} LBL files and {len(img_list)} IMG files, now INSERTing the LBL files to sqllite." )
-
-    if os.path.exists( config.db_loaded_fn ):
-        logger.info( f"Database already loaded, skipping insertion." )
-    else:
-
-        load_and_store_metadata_obj = LoadAndStoreMetadata( name="load_and_store_metadata" )
-
-        with db.SessionLocal() as session:
-            loaded_lbl_list = [ load_and_store_metadata_obj.process(item, session) for item in tqdm.tqdm(lbl_list) ]
-            session.commit()
-
-        open( config.db_loaded_fn, 'w').close()
-
-
-    load_vicar_to_pickle_obj = LoadVicarImageToPickle( name="save_image_to_pickle", cache_path=config.cache_path )
-    with db.SessionLocal() as session:
-        pickled_img_list = [ load_vicar_to_pickle_obj.process(item, session) for item in tqdm.tqdm(img_list) ]
-        session.commit()
-
-    print( len( pickled_img_list))
-    print( "Kicking off compute_and_store_centers ")
-
-    compute_and_store_centers_obj = ComputeAndStoreJupyterCenters( name="compute_and_store_centers", cache_path=config.cache_path )
-    with db.SessionLocal() as session:
-        circled_img_list = [ compute_and_store_centers_obj.process(item, session) for item in tqdm.tqdm( pickled_img_list ) ]
-        session.commit()
-
-
-
-
-
-
+    """Compute circle centers for the pickled images."""
+
+    def __init__(self, commit_every: int = 50):
+        super().__init__(name="compute_circle_centers", depends_on=("load_vicar_to_pickle",))
+        self.commit_every = commit_every
+        self._since_commit = 0
+
+    def produce_items(self, context: pipeline.StageContext):
+        for artifact in context.store.artifacts_for("load_vicar_to_pickle"):
+            product_id = artifact.payload["product_id"]
+            image_record = get_voyager_image_by_product_id(context.session, product_id)
+            if not image_record or image_record.LOCAL_IMAGE_PICKLE_FN is None:
+                continue
+            yield {
+                "product_id": product_id,
+                "pickle_path": image_record.LOCAL_IMAGE_PICKLE_FN,
+                "upstream_hash": artifact.input_hash,
+                "existing_center": (
+                    image_record.BEST_CIRCLE_X,
+                    image_record.BEST_CIRCLE_Y,
+                ),
+            }
+
+    def item_key(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return item["product_id"]
+
+    def item_input_hash(self, context: pipeline.StageContext, item: Dict[str, str]) -> str:
+        return pipeline.stable_hash({"pickle_hash": item["upstream_hash"]})
+
+    def process(self, context: pipeline.StageContext, work_item: pipeline.WorkItem):
+        product_id = work_item.data["product_id"]
+        image_record = get_voyager_image_by_product_id(context.session, product_id)
+        if not image_record or not image_record.LOCAL_IMAGE_PICKLE_FN:
+            raise ValueError(f"Pickled image missing for {product_id}")
+
+        import pickle
+
+        with open(image_record.LOCAL_IMAGE_PICKLE_FN, "rb") as fp:
+            v_im = pickle.load(fp)
+
+        im = analysis.scale_image(v_im.array.squeeze())
+        im_prepped_for_cv2 = analysis.prep_impage_for_cv2(im)
+
+        start_time = time.time()
+        circles = analysis.find_circle_center_parametrized(
+            im_prepped_for_cv2,
+            blur_width=5,
+            method=cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=50,
+            param1=50,
+            param2=44,
+            minRadius=25,
+            maxRadius=0,
+        )
+        elapsed = time.time() - start_time
+
+        if circles is None:
+            return {
+                "product_id": product_id,
+                "status": "no_circles",
+                "elapsed": elapsed,
+            }
+
+        best_circle = circles[0][0]
+        image_record.BEST_CIRCLE_X = int(best_circle[0])
+        image_record.BEST_CIRCLE_Y = int(best_circle[1])
+        image_record.ALL_CIRCLES = json.dumps([c.tolist() for c in circles[0]])
+        image_record.CIRCLE_TIME = float(elapsed)
+
+        self._since_commit += 1
+        if self._since_commit >= self.commit_every:
+            context.session.commit()
+            self._since_commit = 0
+
+        return {
+            "product_id": product_id,
+            "center": (int(best_circle[0]), int(best_circle[1])),
+            "elapsed": elapsed,
+        }
+
+    def on_stage_completed(self, context: pipeline.StageContext) -> None:
+        if self._since_commit:
+            context.session.commit()
+            self._since_commit = 0
+
+
+def build_pipeline() -> pipeline.Pipeline:
+    runner = pipeline.Pipeline(db.SessionLocal)
+    runner.register(ListTarFiles(config.source_path))
+    runner.register(ExtractTarMembers(config.cache_path))
+    runner.register(LoadAndStoreMetadata())
+    runner.register(LoadVicarImageToPickle(config.cache_path))
+    runner.register(ComputeAndStoreJupyterCenters())
+    return runner
+
+
+def main(selected_stages: Iterable[str] | None = None):
+    runner = build_pipeline()
+    runner.run(selected_stages=selected_stages)
 
 
 if __name__ == "__main__":
-
-    logger.info( f"Python path is: {sys.path}")
-    logger.info( f"System path is {os.getcwd()}" )
-
+    logger.info("Python path is: %%s", os.getenv("PYTHONPATH"))
+    logger.info("System path is %s", os.getcwd())
     main()
-
-    from models.image import VoyagerImage
-
-    # print( type( VoyagerImage.EARTH_RECEIVED_TIME.type ) )
-    # print( dir( VoyagerImage ) )
-    # print( VoyagerImage.__table__.columns )
-
-    # for c in VoyagerImage.__table__.columns:
-
-    #     print( c )
-    #     print( c.type )
-
-    # fn = "/home/lobdellb/repos/voyager_flyby/cache/tar_members/VGISS_6115/DATA/C35170XX/C3517001_GEOMED.LBL"
-
-    # with open( fn ) as fp:
-    #     metadata = pvl.loads( fp.read() )
-
-    #     flattened = flatten_vicar_object(metadata, to_exclude=["^VICAR_HEADER", "^IMAGE", "SOURCE_PRODUCT_ID"])
-
-    #     create_user_from_dict(db.SessionLocal() , d=flattened)
-
-
-    print("Done")
+    logger.info("Done")
